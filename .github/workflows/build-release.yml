@@ -1,0 +1,124 @@
+name: Ultimate Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: '指定要编译的 Tag (留空则自动获取最新 Tag)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write    # 允许创建 Release
+  packages: write    # 允许推送到 GHCR (Docker 镜像库)
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. 检出仓库代码 (默认在 ci-build 分支)
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 必须为 0，以获取所有历史提交和 Tags
+
+      # 2. 确定要编译的 Tag，并切换代码状态
+      - name: Determine Version and Checkout Target
+        id: prepare
+        run: |
+          TARGET_TAG="${{ github.event.inputs.version_tag }}"
+          
+          # 如果没有手动输入，则自动寻找最新的 Tag
+          if [ -z "$TARGET_TAG" ]; then
+            TARGET_TAG=$(git describe --tags `git rev-list --tags --max-count=1` 2>/dev/null || echo "")
+          fi
+
+          if [ -z "$TARGET_TAG" ]; then
+            echo "错误: 未找到任何 Tag，请先在 master 打 Tag！"
+            exit 1
+          fi
+
+          echo "即将编译的版本: $TARGET_TAG"
+          echo "VERSION=$TARGET_TAG" >> $GITHUB_OUTPUT
+
+          # 神奇的一步：直接将工作区代码切换到该 Tag 的状态！
+          git checkout $TARGET_TAG
+
+      # 3. 设置 Go 环境
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21' # 请根据你的实际 Go 版本修改
+
+      # 4. 极致优化编译（全静态、高性能、最小体积、多平台设定）
+      - name: Build Optimized Binaries
+        run: |
+          mkdir -p build_output
+          
+          # 【目标平台设定区】在这里自由增删你想编译的系统和架构
+          targets=(
+            "linux/amd64"
+            "linux/arm64"
+            "windows/amd64"
+            "windows/386"
+            "darwin/amd64"
+            "darwin/arm64"
+          )
+
+          for target in "${targets[@]}"; do
+            IFS='/' read -r goos goarch <<< "$target"
+            echo "🚀 正在编译: $goos / $goarch ..."
+
+            output_name="cfst_${goos}_${goarch}"
+            if [ "$goos" = "windows" ]; then
+              output_name+=".exe"
+            fi
+
+            # 核心编译参数解析：
+            # CGO_ENABLED=0            : 禁用 CGO，实现真正的全静态链接 (完全不依赖系统库)
+            # -trimpath                : 移除编译机本地的绝对路径信息，增加安全性，略微减小体积
+            # -ldflags "-s -w"         : 剥离符号表和调试信息，极限压缩体积
+            # -extldflags '-static'    : 强制底层静态链接
+            # -X main.version=...      : 注入版本号
+            CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch go build -trimpath \
+              -ldflags="-s -w -extldflags '-static' -X main.version=${{ steps.prepare.outputs.VERSION }}" \
+              -o build_output/$output_name
+          done
+
+      # 5. 上传二进制文件并创建/更新 GitHub Release
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.prepare.outputs.VERSION }}
+          files: build_output/*
+          generate_release_notes: true # 自动根据 Commit 生成更新日志
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 6. 登录 GitHub 容器镜像仓库
+      - name: Login to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 7. 获取 Dockerfile 并打包推送
+      - name: Build and Push Docker image
+        run: |
+          # 💡 核心魔法：跨越时空，从你的 master 分支单独拉取 Dockerfile
+          # 注意：这里使用 origin/master 是因为在 GitHub Actions 中，
+          # 直接写 master 可能会提示找不到本地分支，用远程分支 origin/master 最稳妥。
+          git checkout origin/master -- Dockerfile
+          
+          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE_NAME="ghcr.io/$OWNER_LC/cfst"
+          
+          # 使用刚刚跨分支拿过来的 Dockerfile 进行构建
+          docker build -t $IMAGE_NAME:latest -t $IMAGE_NAME:${{ steps.prepare.outputs.VERSION }} .
+          
+          docker push $IMAGE_NAME:latest
+          docker push $IMAGE_NAME:${{ steps.prepare.outputs.VERSION }}
