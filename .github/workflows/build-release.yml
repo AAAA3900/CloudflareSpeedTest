@@ -109,6 +109,9 @@ jobs:
       # 7. 获取 Dockerfile 并打包推送
       - name: Build and Push Docker image
         run: |
+          # 第一步：把 GitHub Runner 宿主机的根证书复制到编译输出目录，供 Dockerfile 抓取
+          cp /etc/ssl/certs/ca-certificates.crt build_output/
+          
           # 💡 核心魔法：跨越时空，从你的 master 分支单独拉取 Dockerfile
           # 注意：这里使用 origin/master 是因为在 GitHub Actions 中，
           # 直接写 master 可能会提示找不到本地分支，用远程分支 origin/master 最稳妥。
